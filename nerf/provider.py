@@ -12,7 +12,7 @@ import trimesh
 import torch
 from torch.utils.data import DataLoader
 
-from .utils import get_rays
+from .utils import get_rays, get_rays_also_colmap
 
 
 # ref: https://github.com/NVlabs/instant-ngp/blob/b76004c8cf478880227401ae763be4c02f80b62f/include/neural-graphics-primitives/nerf_loader.h#L50
@@ -26,6 +26,13 @@ def nerf_matrix_to_ngp(pose, scale=0.33, offset=[0, 0, 0]):
     ], dtype=np.float32)
     return new_pose
 
+
+def convert_mat(c2w):
+    c2w[2, :] *= -1
+    c2w = c2w[[1, 0, 2, 3], :]  # swap y and z
+    c2w[0:3, 1] *= -1  # flip the y and z axis
+    c2w[0:3, 2] *= -1
+    return c2w
 
 def visualize_poses(poses, size=0.1):
     # poses: [B, 4, 4]
@@ -180,6 +187,7 @@ class NeRFDataset:
                 pose[:3, :3] = slerp(ratio).as_matrix()
                 pose[:3, 3] = (1 - ratio) * pose0[:3, 3] + ratio * pose1[:3, 3]
                 self.poses.append(pose)
+            print("test")
 
         else:
             # for colmap, manually split a valid set (the first frame).
@@ -192,17 +200,23 @@ class NeRFDataset:
             
             self.poses = []
             self.images = []
+            self.colmap_poses = []
+            self.transformation_matrices = []
+            self.img_names = []
             for f in tqdm.tqdm(frames, desc=f'Loading {type} data'):
                 f_path = os.path.join(self.root_path, f['file_path'])
                 if self.mode == 'blender' and '.' not in os.path.basename(f_path):
-                    f_path += '.png' # so silly...
+                    f_path += '.png'
 
                 # there are non-exist paths in fox...
                 if not os.path.exists(f_path):
                     continue
-                
-                pose = np.array(f['transform_matrix'], dtype=np.float32) # [4, 4]
-                pose = nerf_matrix_to_ngp(pose, scale=self.scale, offset=self.offset)
+
+                pose_colmap = np.array(f['colmap'], dtype=np.float32)
+                pose_nerf = np.array(f['transform_matrix'], dtype=np.float32) # [4, 4]
+                pose = nerf_matrix_to_ngp(pose_nerf, scale=self.scale, offset=self.offset)
+
+                t_nerf_ngp = pose @ np.linalg.inv(pose_colmap)
 
                 image = cv2.imread(f_path, cv2.IMREAD_UNCHANGED) # [H, W, 3] o [H, W, 4]
                 if self.H is None or self.W is None:
@@ -220,16 +234,23 @@ class NeRFDataset:
                     
                 image = image.astype(np.float32) / 255 # [H, W, 3/4]
 
+                self.transformation_matrices.append(t_nerf_ngp)
                 self.poses.append(pose)
                 self.images.append(image)
-            
+                self.colmap_poses.append(pose_colmap)
+                self.img_names.append(f['file_path'])
+
+        # visualize_poses(np.stack(self.poses, axis=0))
         self.poses = torch.from_numpy(np.stack(self.poses, axis=0)) # [N, 4, 4]
+        self.transformation_matrices = torch.from_numpy(np.stack(self.transformation_matrices, axis=0)) # [N, 4, 4]
+        self.colmap_poses = torch.from_numpy(np.stack(self.colmap_poses, axis=0))
+        self.img_names = np.array(self.img_names)
+
         if self.images is not None:
             self.images = torch.from_numpy(np.stack(self.images, axis=0)) # [N, H, W, C]
         
         # calculate mean radius of all camera poses
         self.radius = self.poses[:, :3, 3].norm(dim=-1).mean(0).item()
-        #print(f'[INFO] dataset camera poses: radius = {self.radius:.4f}, bound = {self.bound}')
 
         # initialize error_map
         if self.training and self.opt.error_map:
@@ -273,7 +294,6 @@ class NeRFDataset:
     
         self.intrinsics = np.array([fl_x, fl_y, cx, cy])
 
-
     def collate(self, index):
 
         B = len(index) # a list of length 1
@@ -287,7 +307,6 @@ class NeRFDataset:
             s = np.sqrt(self.H * self.W / self.num_rays) # only in training, assert num_rays > 0
             rH, rW = int(self.H / s), int(self.W / s)
             rays = get_rays(poses, self.intrinsics / s, rH, rW, -1)
-
             return {
                 'H': rH,
                 'W': rW,
@@ -296,16 +315,25 @@ class NeRFDataset:
             }
 
         poses = self.poses[index].to(self.device) # [B, 4, 4]
-
+        poses_colmap = self.colmap_poses[index].to(self.device)
+        t_mat = self.transformation_matrices[index].to(self.device)
         error_map = None if self.error_map is None else self.error_map[index]
         
-        rays = get_rays(poses, self.intrinsics, self.H, self.W, self.num_rays, error_map, self.opt.patch_size)
+        # rays = get_rays(poses, self.intrinsics, self.H, self.W, self.num_rays, error_map, self.opt.patch_size)
+        rays = get_rays_also_colmap(poses, poses_colmap, self.intrinsics, self.H, self.W, self.num_rays, error_map, self.opt.patch_size)
 
         results = {
+            "t_mat": t_mat,
+            "pose": poses,
+            "pose_colmap": poses_colmap,
             'H': self.H,
             'W': self.W,
             'rays_o': rays['rays_o'],
             'rays_d': rays['rays_d'],
+            'rays_o_colmap': rays['rays_o_colmap'],
+            'rays_d_colmap': rays['rays_d_colmap'],
+            'rays_d_cam': rays['rays_d_cam'],
+            "name": self.img_names[index]
         }
 
         if self.images is not None:

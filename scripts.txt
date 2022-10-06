@@ -1,0 +1,1 @@
+python scripts/colmap2nerf.py --images /home/n11373598/work/nerf-vloc/data/horn/images/db_images --run_colmap

@@ -1,3 +1,5 @@
+import sys
+
 import torch
 import argparse
 
@@ -111,14 +113,22 @@ if __name__ == '__main__':
     if opt.test:
         
         metrics = [PSNRMeter(), LPIPSMeter(device=device)]
-        trainer = Trainer('ngp', opt, model, device=device, workspace=opt.workspace, criterion=criterion, fp16=opt.fp16, metrics=metrics, use_checkpoint=opt.ckpt)
+        trainer = Trainer('ngp', opt, model, device=device, workspace=opt.workspace, criterion=criterion, fp16=opt.fp16,
+                          metrics=metrics, use_checkpoint=opt.ckpt)
+
+        query_only = True
+        if query_only:
+            test_loader = NeRFDataset(opt, device=device, type='test').dataloader()
+            trainer.query_only(test_loader, write_video=True)  # test and save video
+            sys.exit()
 
         if opt.gui:
             gui = NeRFGUI(opt, trainer)
             gui.render()
         
         else:
-            test_loader = NeRFDataset(opt, device=device, type='test').dataloader()
+            # data = NeRFDataset(opt, device=device, type='test')
+            test_loader = NeRFDataset(opt, device=device, type='train').dataloader()
 
             if test_loader.has_gt:
                 trainer.evaluate(test_loader) # blender has gt, so evaluate it.

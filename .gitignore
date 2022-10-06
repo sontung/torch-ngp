@@ -15,3 +15,8 @@ dnerf/network_basis_perpoint.py
 
 **neus*
 neus/
+
+.idea/*
+*.pickle
+*.lprof
+horn_ws/*

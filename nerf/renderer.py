@@ -219,11 +219,16 @@ class NeRFRenderer(nn.Module):
         #print(xyzs.shape, 'valid_rgb:', mask.sum().item())
 
         # calculate weight_sum (mask)
-        weights_sum = weights.sum(dim=-1) # [N]
+        weights_sum = weights.sum(dim=-1)  # [N]
         
-        # calculate depth 
+        # calculate depth
+        # cumsum_weights = torch.cumsum(weights, dim=-1) # [N, T]
+        # median_mask = cumsum_weights > 0.5 # [N, T]
+        # median_mask[..., 1:] = torch.logical_xor(median_mask[..., :-1], median_mask[..., 1:]) # 1st non-zero
+        # depth = torch.sum(median_mask * z_vals, dim=-1) # [N]
+
         ori_z_vals = ((z_vals - nears) / (fars - nears)).clamp(0, 1)
-        depth = torch.sum(weights * ori_z_vals, dim=-1)
+        depth = torch.sum(weights * z_vals, dim=-1)
 
         # calculate color
         image = torch.sum(weights.unsqueeze(-1) * rgbs, dim=-2) # [N, 3], in [0, 1]
@@ -240,11 +245,6 @@ class NeRFRenderer(nn.Module):
 
         image = image.view(*prefix, 3)
         depth = depth.view(*prefix)
-
-        # tmp: reg loss in mip-nerf 360
-        # z_vals_shifted = torch.cat([z_vals[..., 1:], sample_dist * torch.ones_like(z_vals[..., :1])], dim=-1)
-        # mid_zs = (z_vals + z_vals_shifted) / 2 # [N, T]
-        # loss_dist = (torch.abs(mid_zs.unsqueeze(1) - mid_zs.unsqueeze(2)) * (weights.unsqueeze(1) * weights.unsqueeze(2))).sum() + 1/3 * ((z_vals_shifted - z_vals_shifted) * (weights ** 2)).sum()
 
         return {
             'depth': depth,

@@ -2,6 +2,8 @@ import os
 import glob
 import tqdm
 import math
+import open3d as o3d
+
 import imageio
 import random
 import warnings
@@ -47,7 +49,6 @@ def linear_to_srgb(x):
 @torch.jit.script
 def srgb_to_linear(x):
     return torch.where(x < 0.04045, x / 12.92, ((x + 0.055) / 1.055) ** 2.4)
-
 
 @torch.cuda.amp.autocast(enabled=False)
 def get_rays(poses, intrinsics, H, W, N=-1, error_map=None, patch_size=1):
@@ -136,6 +137,148 @@ def get_rays(poses, intrinsics, H, W, N=-1, error_map=None, patch_size=1):
     return results
 
 
+@torch.cuda.amp.autocast(enabled=False)
+def get_rays_also_colmap(poses, poses_cm, intrinsics, H, W, N=-1, error_map=None, patch_size=1):
+    ''' get rays
+    Args:
+        poses: [B, 4, 4], cam2world
+        intrinsics: [4]
+        H, W, N: int
+        error_map: [B, 128 * 128], sample probability based on training error
+    Returns:
+        rays_o, rays_d: [B, N, 3]
+        inds: [B, N]
+    '''
+
+    device = poses.device
+    B = poses.shape[0]
+    fx, fy, cx, cy = intrinsics
+
+    i, j = custom_meshgrid(torch.linspace(0, W-1, W, device=device), torch.linspace(0, H-1, H, device=device)) # float
+    i = i.t().reshape([1, H*W]).expand([B, H*W]) + 0.5
+    j = j.t().reshape([1, H*W]).expand([B, H*W]) + 0.5
+
+    results = {}
+
+    if N > 0:
+        N = min(N, H*W)
+
+        # if use patch-based sampling, ignore error_map
+        if patch_size > 1:
+
+            # random sample left-top cores.
+            # NOTE: this impl will lead to less sampling on the image corner pixels... but I don't have other ideas.
+            num_patch = N // (patch_size ** 2)
+            inds_x = torch.randint(0, H - patch_size, size=[num_patch], device=device)
+            inds_y = torch.randint(0, W - patch_size, size=[num_patch], device=device)
+            inds = torch.stack([inds_x, inds_y], dim=-1) # [np, 2]
+
+            # create meshgrid for each patch
+            pi, pj = custom_meshgrid(torch.arange(patch_size, device=device), torch.arange(patch_size, device=device))
+            offsets = torch.stack([pi.reshape(-1), pj.reshape(-1)], dim=-1) # [p^2, 2]
+
+            inds = inds.unsqueeze(1) + offsets.unsqueeze(0) # [np, p^2, 2]
+            inds = inds.view(-1, 2) # [N, 2]
+            inds = inds[:, 0] * W + inds[:, 1] # [N], flatten
+
+            inds = inds.expand([B, N])
+
+        elif error_map is None:
+            inds = torch.randint(0, H*W, size=[N], device=device) # may duplicate
+            inds = inds.expand([B, N])
+        else:
+
+            # weighted sample on a low-reso grid
+            inds_coarse = torch.multinomial(error_map.to(device), N, replacement=False) # [B, N], but in [0, 128*128)
+
+            # map to the original resolution with random perturb.
+            inds_x, inds_y = inds_coarse // 128, inds_coarse % 128 # `//` will throw a warning in torch 1.10... anyway.
+            sx, sy = H / 128, W / 128
+            inds_x = (inds_x * sx + torch.rand(B, N, device=device) * sx).long().clamp(max=H - 1)
+            inds_y = (inds_y * sy + torch.rand(B, N, device=device) * sy).long().clamp(max=W - 1)
+            inds = inds_x * W + inds_y
+
+            results['inds_coarse'] = inds_coarse # need this when updating error_map
+
+        i = torch.gather(i, -1, inds)
+        j = torch.gather(j, -1, inds)
+
+        results['inds'] = inds
+
+    else:
+        inds = torch.arange(H*W, device=device).expand([B, H*W])
+
+    zs = torch.ones_like(i)
+    xs = (i - cx) / fx * zs
+    ys = (j - cy) / fy * zs
+    directions = torch.stack((xs, ys, zs), dim=-1)
+    directions = directions / torch.norm(directions, dim=-1, keepdim=True)
+
+    rays_d = directions @ poses[:, :3, :3].transpose(-1, -2) # (B, N, 3)
+    rays_o = poses[..., :3, 3] # [B, 3]
+    rays_o = rays_o[..., None, :].expand_as(rays_d) # [B, N, 3]
+
+    results['rays_o'] = rays_o
+    results['rays_d'] = rays_d
+
+    # poses_cm[2, :] *= -1  # flip whole world upside down
+    # poses_cm = poses_cm[[1, 0, 2, 3], :]  # swap y and z
+    # poses_cm[0:3, 1] *= -1
+    # poses_cm[0:3, 2] *= -1  # flip the y and z axis
+    # print(poses_cm)
+    # print()
+
+    rays_d = directions @ poses_cm[:, :3, :3]
+    rays_o = poses_cm[..., :3, 3] # [B, 3]
+    rays_o = rays_o[..., None, :].expand_as(rays_d) # [B, N, 3]
+    results['rays_o_colmap'] = rays_o
+    results['rays_d_colmap'] = rays_d
+    results["rays_d_cam"] = directions
+
+    # import open3d as o3d
+    # rd = rays_d.detach().cpu().numpy()[0, :]
+    # ro = rays_o[0, 0, :].detach().cpu().numpy()
+    # vis = o3d.visualization.Visualizer()
+    # vis.create_window(width=1920, height=1025)
+    #
+    # points = [ro+d*2 for d in rd]
+    # points.append(ro)
+    # lines = [[i, len(points)-1] for i in range(0, len(points)-1, 100)]
+    # colors = [[1, 0, 0] for _ in range(len(lines))]
+    # line_set2 = o3d.geometry.LineSet()
+    # line_set2.points = o3d.utility.Vector3dVector(points)
+    # line_set2.lines = o3d.utility.Vector2iVector(lines)
+    # line_set2.colors = o3d.utility.Vector3dVector(colors)
+    # vis.add_geometry(line_set2)
+    #
+    # rd = directions.detach().cpu().numpy()[0, :]
+    # points = [ro+d*2 for d in rd]
+    # points.append(ro)
+    # lines = [[i, len(points)-1] for i in range(0, len(points)-1, 100)]
+    # colors = [[0, 1, 0] for _ in range(len(lines))]
+    # line_set = o3d.geometry.LineSet()
+    # line_set.points = o3d.utility.Vector3dVector(points)
+    # line_set.lines = o3d.utility.Vector2iVector(lines)
+    # line_set.colors = o3d.utility.Vector3dVector(colors)
+    # vis.add_geometry(line_set)
+    #
+    # rd = rays_d2.detach().cpu().numpy()[0, :]
+    # points = [ro+d*2 for d in rd]
+    # points.append(ro)
+    # lines = [[i, len(points)-1] for i in range(0, len(points)-1, 100)]
+    # colors = [[0, 0, 1] for _ in range(len(lines))]
+    # line_set = o3d.geometry.LineSet()
+    # line_set.points = o3d.utility.Vector3dVector(points)
+    # line_set.lines = o3d.utility.Vector2iVector(lines)
+    # line_set.colors = o3d.utility.Vector3dVector(colors)
+    # vis.add_geometry(line_set)
+    #
+    # vis.run()
+    # vis.destroy_window()
+
+    return results
+
+
 def seed_everything(seed):
     random.seed(seed)
     os.environ['PYTHONHASHSEED'] = str(seed)
@@ -151,16 +294,16 @@ def torch_vis_2d(x, renormalize=False):
     import matplotlib.pyplot as plt
     import numpy as np
     import torch
-    
+
     if isinstance(x, torch.Tensor):
         if len(x.shape) == 3:
             x = x.permute(1,2,0).squeeze()
         x = x.detach().cpu().numpy()
-        
+
     print(f'[torch_vis_2d] {x.shape}, {x.dtype}, {x.min()} ~ {x.max()}')
-    
+
     x = x.astype(np.float32)
-    
+
     # renormalize
     if renormalize:
         x = (x - x.min(axis=0, keepdims=True)) / (x.max(axis=0, keepdims=True) - x.min(axis=0, keepdims=True) + 1e-8)
@@ -192,7 +335,7 @@ def extract_geometry(bound_min, bound_max, resolution, threshold, query_func):
     u = extract_fields(bound_min, bound_max, resolution, query_func)
 
     #print(u.shape, u.max(), u.min(), np.percentile(u, 50))
-    
+
     vertices, triangles = mcubes.marching_cubes(u, threshold)
 
     b_max_np = bound_max.detach().cpu().numpy()
@@ -200,6 +343,95 @@ def extract_geometry(bound_min, bound_max, resolution, threshold, query_func):
 
     vertices = vertices / (resolution - 1.0) * (b_max_np - b_min_np)[None, :] + b_min_np[None, :]
     return vertices, triangles
+
+
+def return_cam_mesh_with_pose(localization_results):
+    metadata = {'f': 421.102, "h": 378, "w": 504}
+    metadata["cx"] = metadata["h"]*0.5
+    metadata["cy"] = metadata["w"]*0.5
+    focal = metadata["f"]
+    w = metadata["w"]
+    h = metadata["h"]
+    k_mat = np.array([
+        [focal, 0, 0.5 * w],
+        [0, focal, 0.5 * h],
+        [0, 0, 1]
+    ])
+    intrinsic_parameters = {"mat": k_mat.astype(np.float64), "width": w, "height": h}
+
+    cameras = []
+    for result in localization_results:
+        camera_mesh2 = o3d.geometry.LineSet.create_camera_visualization(intrinsic_parameters["width"],
+                                                                        intrinsic_parameters["height"],
+                                                                        intrinsic_parameters["mat"], np.eye(4), 0.05)
+        camera_mesh2.paint_uniform_color((1, 0, 0))
+        camera_mesh2.transform(result[0, :])
+        cameras.append(camera_mesh2)
+    return cameras
+
+
+def make_point_cloud_from_nerf(rgb_mat, xyz_mat, poses, ls):
+    """
+    making a point cloud which are observed by nerf's images
+    :param rgb_mat: (n, x, y, 3)
+    :param depth_mat: (n, x, y)
+    :param ro_mat: (n, x*y, 3) ray origin
+    :param rd_mat: (n, x*y, 3) ray direction
+    :return:
+    """
+    rgb_mat = np.clip(rgb_mat, 0, 1)
+
+    vis = o3d.visualization.Visualizer()
+    vis.create_window(width=1920, height=1025)
+
+    if len(xyz_mat) > 0:
+        point_cloud = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(xyz_mat.reshape((-1, 3))))
+        point_cloud.colors = o3d.utility.Vector3dVector(rgb_mat.reshape((-1, 3)))
+        vis.add_geometry(point_cloud)
+    cameras = return_cam_mesh_with_pose(poses)
+    for c in cameras:
+        vis.add_geometry(c)
+
+    for line_set in ls:
+        vis.add_geometry(line_set)
+
+    vis.run()
+    vis.destroy_window()
+
+    return
+
+
+def ngp_ray_to_nerf(rays_o, rays_d, scale=0.33):
+    rays_o = rays_o / scale
+
+    # convert yzx to xyz
+    tmp = rays_o.detach().clone()
+    rays_o[..., 0] = tmp[..., 2]
+    rays_o[..., 1] = tmp[..., 0]
+    rays_o[..., 2] = tmp[..., 1]
+
+    tmp = rays_d.detach().clone()
+    rays_d[..., 0] = tmp[..., 2]
+    rays_d[..., 1] = tmp[..., 0]
+    rays_d[..., 2] = tmp[..., 1]
+    return rays_o, rays_d
+
+
+def convert_mat(c2w):
+    c2w[2, :] *= -1
+    c2w = c2w[[1, 0, 2, 3], :]  # swap y and z
+    c2w[0:3, 2] *= -1  # flip the y and z axis
+    c2w[0:3, 1] *= -1
+    return c2w
+
+
+def ngp_to_nerf(mat):
+
+    tmp = mat.detach().clone()
+    mat[..., 0] = tmp[..., 2]
+    mat[..., 1] = tmp[..., 0]
+    mat[..., 2] = tmp[..., 1]
+    return mat
 
 
 class PSNRMeter:
@@ -222,10 +454,10 @@ class PSNRMeter:
 
     def update(self, preds, truths):
         preds, truths = self.prepare_inputs(preds, truths) # [B, N, 3] or [B, H, W, 3], range[0, 1]
-          
+
         # simplified since max_pixel_value is 1 here.
         psnr = -10 * np.log10(np.mean((preds - truths) ** 2))
-        
+
         self.V += psnr
         self.N += 1
 
@@ -258,13 +490,13 @@ class LPIPSMeter:
             inp = inp.to(self.device)
             outputs.append(inp)
         return outputs
-    
+
     def update(self, preds, truths):
         preds, truths = self.prepare_inputs(preds, truths) # [B, H, W, 3] --> [B, 3, H, W], range in [0, 1]
         v = self.fn(truths, preds, normalize=True).item() # normalize=True: [0, 1] to [-1, 1]
         self.V += v
         self.N += 1
-    
+
     def measure(self):
         return self.V / self.N
 
@@ -275,7 +507,7 @@ class LPIPSMeter:
         return f'LPIPS ({self.net}) = {self.measure():.6f}'
 
 class Trainer(object):
-    def __init__(self, 
+    def __init__(self,
                  name, # name of this experiment
                  opt, # extra conf
                  model, # network 
@@ -299,7 +531,7 @@ class Trainer(object):
                  use_tensorboardX=True, # whether to use tensorboard for logging
                  scheduler_update_every_step=False, # whether to call scheduler.step() after every train step
                  ):
-        
+
         self.name = name
         self.opt = opt
         self.mute = mute
@@ -363,7 +595,7 @@ class Trainer(object):
             "results": [], # metrics[0], or valid_loss
             "checkpoints": [], # record path of saved ckpt, to automatically remove old ckpt
             "best_result": None,
-            }
+        }
 
         # auto fix
         if len(metrics) == 0 or self.use_loss_as_metric:
@@ -372,14 +604,14 @@ class Trainer(object):
         # workspace prepare
         self.log_ptr = None
         if self.workspace is not None:
-            os.makedirs(self.workspace, exist_ok=True)        
+            os.makedirs(self.workspace, exist_ok=True)
             self.log_path = os.path.join(workspace, f"log_{self.name}.txt")
             self.log_ptr = open(self.log_path, "a+")
 
             self.ckpt_path = os.path.join(self.workspace, 'checkpoints')
             self.best_path = f"{self.ckpt_path}/{self.name}.pth"
             os.makedirs(self.ckpt_path, exist_ok=True)
-            
+
         self.log(f'[INFO] Trainer: {self.name} | {self.time_stamp} | {self.device} | {"fp16" if self.fp16 else "fp32"} | {self.workspace}')
         self.log(f'[INFO] #parameters: {sum([p.numel() for p in model.parameters() if p.requires_grad])}')
 
@@ -402,7 +634,7 @@ class Trainer(object):
             else: # path to ckpt
                 self.log(f"[INFO] Loading {self.use_checkpoint} ...")
                 self.load_checkpoint(self.use_checkpoint)
-        
+
         # clip loss prepare
         if opt.rand_pose >= 0: # =0 means only using CLIP loss, >0 means a hybrid mode.
             from nerf.clip_utils import CLIPLoss
@@ -411,16 +643,16 @@ class Trainer(object):
 
 
     def __del__(self):
-        if self.log_ptr: 
+        if self.log_ptr:
             self.log_ptr.close()
 
 
     def log(self, *args, **kwargs):
         if self.local_rank == 0:
-            if not self.mute: 
+            if not self.mute:
                 #print(*args)
                 self.console.print(*args, **kwargs)
-            if self.log_ptr: 
+            if self.log_ptr:
                 print(*args, file=self.log_ptr)
                 self.log_ptr.flush() # write immediately to file
 
@@ -445,7 +677,7 @@ class Trainer(object):
             #torch_vis_2d(pred_rgb[0])
 
             loss = self.clip_loss(pred_rgb)
-            
+
             return pred_rgb, None, loss
 
         images = data['images'] # [B, N, 3/4]
@@ -470,7 +702,7 @@ class Trainer(object):
 
         outputs = self.model.render(rays_o, rays_d, staged=False, bg_color=bg_color, perturb=True, force_all_rays=False if self.opt.patch_size == 1 else True, **vars(self.opt))
         # outputs = self.model.render(rays_o, rays_d, staged=False, bg_color=bg_color, perturb=True, force_all_rays=True, **vars(self.opt))
-    
+
         pred_rgb = outputs['image']
 
         # MSE loss
@@ -507,7 +739,7 @@ class Trainer(object):
             #     cv2.imwrite(os.path.join(self.workspace, f'{self.global_step}.jpg'), (tmp * 255).astype(np.uint8))
 
             error = loss.detach().to(error_map.device) # [B, N], already in [0, 1]
-            
+
             # ema update
             ema_error = 0.1 * error_map.gather(1, inds) + 0.9 * error
             error_map.scatter_(1, inds, ema_error)
@@ -540,7 +772,7 @@ class Trainer(object):
             gt_rgb = images[..., :3] * images[..., 3:] + bg_color * (1 - images[..., 3:])
         else:
             gt_rgb = images
-        
+
         outputs = self.model.render(rays_o, rays_d, staged=True, bg_color=bg_color, perturb=False, **vars(self.opt))
 
         pred_rgb = outputs['image'].reshape(B, H, W, 3)
@@ -551,7 +783,7 @@ class Trainer(object):
         return pred_rgb, pred_depth, gt_rgb, loss
 
     # moved out bg_color and perturb for more flexible control...
-    def test_step(self, data, bg_color=None, perturb=False):  
+    def test_step(self, data, bg_color=None, perturb=False):
 
         rays_o = data['rays_o'] # [B, N, 3]
         rays_d = data['rays_d'] # [B, N, 3]
@@ -566,7 +798,6 @@ class Trainer(object):
         pred_depth = outputs['depth'].reshape(-1, H, W)
 
         return pred_rgb, pred_depth
-
 
     def save_mesh(self, save_path=None, resolution=256, threshold=10):
 
@@ -602,7 +833,7 @@ class Trainer(object):
 
         # get a ref to error_map
         self.error_map = train_loader._data.error_map
-        
+
         for epoch in range(self.epoch + 1, max_epochs + 1):
             self.epoch = epoch
 
@@ -632,7 +863,7 @@ class Trainer(object):
             name = f'{self.name}_ep{self.epoch:04d}'
 
         os.makedirs(save_path, exist_ok=True)
-        
+
         self.log(f"==> Start Test, save results to {save_path}")
 
         pbar = tqdm.tqdm(total=len(loader) * loader.batch_size, bar_format='{percentage:3.0f}% {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]')
@@ -645,7 +876,7 @@ class Trainer(object):
         with torch.no_grad():
 
             for i, data in enumerate(loader):
-                
+
                 with torch.cuda.amp.autocast(enabled=self.fp16):
                     preds, preds_depth = self.test_step(data)
 
@@ -666,7 +897,7 @@ class Trainer(object):
                     cv2.imwrite(os.path.join(save_path, f'{name}_{i:04d}_depth.png'), pred_depth)
 
                 pbar.update(loader.batch_size)
-        
+
         if write_video:
             all_preds = np.stack(all_preds, axis=0)
             all_preds_depth = np.stack(all_preds_depth, axis=0)
@@ -674,14 +905,94 @@ class Trainer(object):
             imageio.mimwrite(os.path.join(save_path, f'{name}_depth.mp4'), all_preds_depth, fps=25, quality=8, macro_block_size=1)
 
         self.log(f"==> Finished Test.")
-    
+
+    def query_only(self, loader, save_path=None, name=None, write_video=True):
+
+        if save_path is None:
+            save_path = os.path.join(self.workspace, 'results')
+
+        if name is None:
+            name = f'{self.name}_ep{self.epoch:04d}'
+
+        os.makedirs(save_path, exist_ok=True)
+
+        self.log(f"==> Start Test, save results to {save_path}")
+
+        pbar = tqdm.tqdm(total=len(loader) * loader.batch_size,
+                         bar_format='{percentage:3.0f}% {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]')
+        self.model.eval()
+
+        all_depths = []
+        all_ro = []
+        all_rd = []
+        all_names = []
+        all_sizes = []
+        all_rgb = []
+        all_xyz = []
+        all_pose = []
+        list1 = []
+
+        debug_data = {}
+        with torch.no_grad():
+            for i, data in enumerate(loader):
+                with torch.cuda.amp.autocast(enabled=self.fp16):
+                    preds, preds_depth = self.test_step(data)
+
+                if self.opt.color_space == 'linear':
+                    preds = linear_to_srgb(preds)
+
+                pred = preds[0].detach().cpu().numpy()
+
+                img_name = data["name"]
+                depth = torch.reshape(preds_depth[0], (-1,)).cpu()
+
+                rays_o = data['rays_o']  # [B, N, 3]
+                rays_d = data['rays_d']  # [B, N, 3]
+                ro = rays_o[0].cpu().clone()
+                rd = rays_d[0].cpu().clone()
+
+                pred_3D_ngp = ro + depth[..., None] * rd
+                pred_3D_ngp = pred_3D_ngp.to(self.device)
+                # pred_3D_ngp_homog = torch.cat([pred_3D_ngp, torch.ones((pred_3D_ngp.shape[0], 1), device=self.device)],
+                #                               axis=1)
+                # pred_3D_nerf = (torch.inverse(data["t_mat"]) @ pred_3D_ngp_homog.T).T
+
+                all_xyz.append(pred_3D_ngp.cpu().numpy())
+                all_pose.append(data["pose"].detach().cpu().numpy())
+
+                # all_xyz.append(pred_3D_nerf[:, :3, 0].cpu().numpy())
+                # all_pose.append(data["pose_colmap"].detach().cpu().numpy())
+
+                debug_data[img_name[0]] = [preds.cpu(), preds_depth.cpu()]
+
+                all_rgb.append(pred)
+                all_ro.append(rays_o[0].cpu().numpy())
+                all_rd.append(rays_d[0].cpu().numpy())
+                all_depths.append(depth.cpu().numpy())
+                all_names.append(img_name[0])
+                all_sizes.append(pred.shape)
+
+                pbar.update(loader.batch_size)
+                # break
+                # if i > 5:
+                #     break
+        import pickle
+        # data = [all_ro, all_rd, all_depths, all_names, all_sizes]
+        with open('debug.pickle', 'wb') as handle:
+            pickle.dump(debug_data, handle, protocol=pickle.HIGHEST_PROTOCOL)
+
+        if len(all_xyz) > 0:
+            all_xyz = np.stack(all_xyz, axis=0)
+            all_rgb = np.stack(all_rgb, axis=0).reshape((all_xyz.shape[0], -1, 3))
+        make_point_cloud_from_nerf(all_rgb, all_xyz, all_pose, list1)
+
     # [GUI] just train for 16 steps, without any other overhead that may slow down rendering.
     def train_gui(self, train_loader, step=16):
 
         self.model.train()
 
         total_loss = torch.tensor([0], dtype=torch.float32, device=self.device)
-        
+
         loader = iter(train_loader)
 
         # mark untrained grid
@@ -689,7 +1000,7 @@ class Trainer(object):
             self.model.mark_untrained_grid(train_loader._data.poses, train_loader._data.intrinsics)
 
         for _ in range(step):
-            
+
             # mimic an infinite loop dataloader (in case the total dataset is smaller than step)
             try:
                 data = next(loader)
@@ -701,18 +1012,18 @@ class Trainer(object):
             if self.model.cuda_ray and self.global_step % self.opt.update_extra_interval == 0:
                 with torch.cuda.amp.autocast(enabled=self.fp16):
                     self.model.update_extra_state()
-            
+
             self.global_step += 1
 
             self.optimizer.zero_grad()
 
             with torch.cuda.amp.autocast(enabled=self.fp16):
                 preds, truths, loss = self.train_step(data)
-         
+
             self.scaler.scale(loss).backward()
             self.scaler.step(self.optimizer)
             self.scaler.update()
-            
+
             if self.scheduler_update_every_step:
                 self.lr_scheduler.step()
 
@@ -733,13 +1044,12 @@ class Trainer(object):
             'loss': average_loss,
             'lr': self.optimizer.param_groups[0]['lr'],
         }
-        
+
         return outputs
 
-    
     # [GUI] test on a single image
     def test_gui(self, pose, intrinsics, W, H, bg_color=None, spp=1, downscale=1):
-        
+
         # render resolution (may need downscale to for better frame rate)
         rH = int(H * downscale)
         rW = int(W * downscale)
@@ -755,7 +1065,7 @@ class Trainer(object):
             'H': rH,
             'W': rW,
         }
-        
+
         self.model.eval()
 
         if self.ema is not None:
@@ -803,19 +1113,19 @@ class Trainer(object):
         # ref: https://pytorch.org/docs/stable/data.html
         if self.world_size > 1:
             loader.sampler.set_epoch(self.epoch)
-        
+
         if self.local_rank == 0:
             pbar = tqdm.tqdm(total=len(loader) * loader.batch_size, bar_format='{desc}: {percentage:3.0f}% {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]')
 
         self.local_step = 0
 
         for data in loader:
-            
+
             # update grid every 16 steps
             if self.model.cuda_ray and self.global_step % self.opt.update_extra_interval == 0:
                 with torch.cuda.amp.autocast(enabled=self.fp16):
                     self.model.update_extra_state()
-                    
+
             self.local_step += 1
             self.global_step += 1
 
@@ -823,7 +1133,7 @@ class Trainer(object):
 
             with torch.cuda.amp.autocast(enabled=self.fp16):
                 preds, truths, loss = self.train_step(data)
-         
+
             self.scaler.scale(loss).backward()
             self.scaler.step(self.optimizer)
             self.scaler.update()
@@ -838,7 +1148,7 @@ class Trainer(object):
                 if self.report_metric_at_train:
                     for metric in self.metrics:
                         metric.update(preds, truths)
-                        
+
                 if self.use_tensorboardX:
                     self.writer.add_scalar("train/loss", loss_val, self.global_step)
                     self.writer.add_scalar("train/lr", self.optimizer.param_groups[0]['lr'], self.global_step)
@@ -872,7 +1182,6 @@ class Trainer(object):
 
         self.log(f"==> Finished Epoch {self.epoch}.")
 
-
     def evaluate_one_epoch(self, loader, name=None):
         self.log(f"++> Evaluate at epoch {self.epoch} ...")
 
@@ -896,7 +1205,7 @@ class Trainer(object):
         with torch.no_grad():
             self.local_step = 0
 
-            for data in loader:    
+            for data in loader:
                 self.local_step += 1
 
                 with torch.cuda.amp.autocast(enabled=self.fp16):
@@ -906,7 +1215,7 @@ class Trainer(object):
                 if self.world_size > 1:
                     dist.all_reduce(loss, op=dist.ReduceOp.SUM)
                     loss = loss / self.world_size
-                    
+
                     preds_list = [torch.zeros_like(preds).to(self.device) for _ in range(self.world_size)] # [[B, ...], [B, ...], ...]
                     dist.all_gather(preds_list, preds)
                     preds = torch.cat(preds_list, dim=0)
@@ -918,7 +1227,7 @@ class Trainer(object):
                     truths_list = [torch.zeros_like(truths).to(self.device) for _ in range(self.world_size)] # [[B, ...], [B, ...], ...]
                     dist.all_gather(truths_list, truths)
                     truths = torch.cat(truths_list, dim=0)
-                
+
                 loss_val = loss.item()
                 total_loss += loss_val
 
@@ -943,7 +1252,7 @@ class Trainer(object):
 
                     pred_depth = preds_depth[0].detach().cpu().numpy()
                     pred_depth = (pred_depth * 255).astype(np.uint8)
-                    
+
                     cv2.imwrite(save_path, cv2.cvtColor(pred, cv2.COLOR_RGB2BGR))
                     cv2.imwrite(save_path_depth, pred_depth)
 
@@ -994,7 +1303,7 @@ class Trainer(object):
             state['scaler'] = self.scaler.state_dict()
             if self.ema is not None:
                 state['ema'] = self.ema.state_dict()
-        
+
         if not best:
 
             state['model'] = self.model.state_dict()
@@ -1011,7 +1320,7 @@ class Trainer(object):
 
             torch.save(state, file_path)
 
-        else:    
+        else:
             if len(self.stats["results"]) > 0:
                 if self.stats["best_result"] is None or self.stats["results"][-1] < self.stats["best_result"]:
                     self.log(f"[INFO] New best result: {self.stats['best_result']} --> {self.stats['results'][-1]}")
@@ -1030,11 +1339,11 @@ class Trainer(object):
 
                     if self.ema is not None:
                         self.ema.restore()
-                    
+
                     torch.save(state, self.best_path)
             else:
                 self.log(f"[WARN] no evaluated results found, skip saving best checkpoint.")
-            
+
     def load_checkpoint(self, checkpoint=None, model_only=False):
         if checkpoint is None:
             checkpoint_list = sorted(glob.glob(f'{self.ckpt_path}/{self.name}_ep*.pth'))
@@ -1046,7 +1355,7 @@ class Trainer(object):
                 return
 
         checkpoint_dict = torch.load(checkpoint, map_location=self.device)
-        
+
         if 'model' not in checkpoint_dict:
             self.model.load_state_dict(checkpoint_dict)
             self.log("[INFO] loaded model.")
@@ -1057,7 +1366,7 @@ class Trainer(object):
         if len(missing_keys) > 0:
             self.log(f"[WARN] missing keys: {missing_keys}")
         if len(unexpected_keys) > 0:
-            self.log(f"[WARN] unexpected keys: {unexpected_keys}")   
+            self.log(f"[WARN] unexpected keys: {unexpected_keys}")
 
         if self.ema is not None and 'ema' in checkpoint_dict:
             self.ema.load_state_dict(checkpoint_dict['ema'])
@@ -1067,7 +1376,7 @@ class Trainer(object):
                 self.model.mean_count = checkpoint_dict['mean_count']
             if 'mean_density' in checkpoint_dict:
                 self.model.mean_density = checkpoint_dict['mean_density']
-        
+
         if model_only:
             return
 
@@ -1075,21 +1384,21 @@ class Trainer(object):
         self.epoch = checkpoint_dict['epoch']
         self.global_step = checkpoint_dict['global_step']
         self.log(f"[INFO] load at epoch {self.epoch}, global step {self.global_step}")
-        
+
         if self.optimizer and 'optimizer' in checkpoint_dict:
             try:
                 self.optimizer.load_state_dict(checkpoint_dict['optimizer'])
                 self.log("[INFO] loaded optimizer.")
             except:
                 self.log("[WARN] Failed to load optimizer.")
-        
+
         if self.lr_scheduler and 'lr_scheduler' in checkpoint_dict:
             try:
                 self.lr_scheduler.load_state_dict(checkpoint_dict['lr_scheduler'])
                 self.log("[INFO] loaded scheduler.")
             except:
                 self.log("[WARN] Failed to load scheduler.")
-        
+
         if self.scaler and 'scaler' in checkpoint_dict:
             try:
                 self.scaler.load_state_dict(checkpoint_dict['scaler'])

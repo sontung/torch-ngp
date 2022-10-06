@@ -131,15 +131,15 @@ def qvec2rotmat(qvec):
     ])
 
 def rotmat(a, b):
-	a, b = a / np.linalg.norm(a), b / np.linalg.norm(b)
-	v = np.cross(a, b)
-	c = np.dot(a, b)
-	# handle exception for the opposite direction input
-	if c < -1 + 1e-10:
-		return rotmat(a + np.random.uniform(-1e-2, 1e-2, 3), b)
-	s = np.linalg.norm(v)
-	kmat = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
-	return np.eye(3) + kmat + kmat.dot(kmat) * ((1 - c) / (s ** 2 + 1e-10))
+    a, b = a / np.linalg.norm(a), b / np.linalg.norm(b)
+    v = np.cross(a, b)
+    c = np.dot(a, b)
+    # handle exception for the opposite direction input
+    if c < -1 + 1e-10:
+        return rotmat(a + np.random.uniform(-1e-2, 1e-2, 3), b)
+    s = np.linalg.norm(v)
+    kmat = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
+    return np.eye(3) + kmat + kmat.dot(kmat) * ((1 - c) / (s ** 2 + 1e-10))
 
 def closest_point_2_lines(oa, da, ob, db): # returns point closest to both rays of form o+t*d, and a weight factor that goes to 0 if the lines are parallel
     da = da / np.linalg.norm(da)
@@ -155,6 +155,30 @@ def closest_point_2_lines(oa, da, ob, db): # returns point closest to both rays 
         tb = 0
     return (oa+ta*da+ob+tb*db) * 0.5, denom
 
+
+def nerf_matrix_to_ngp(pose, scale=0.33, offset=[0, 0, 0]):
+    # for the fox dataset, 0.33 scales camera radius to ~ 2
+    new_pose = np.array([
+        [pose[1, 0], -pose[1, 1], -pose[1, 2], pose[1, 3] * scale + offset[0]],
+        [pose[2, 0], -pose[2, 1], -pose[2, 2], pose[2, 3] * scale + offset[1]],
+        [pose[0, 0], -pose[0, 1], -pose[0, 2], pose[0, 3] * scale + offset[2]],
+        [0, 0, 0, 1],
+    ], dtype=np.float32)
+    return new_pose
+
+
+def add_cams(vis_, intrinsic_parameters_, loc_list, color, scale_=None):
+    if scale_ is None:
+        scale_ = 0.8
+    for result_ in loc_list:
+        camera_mesh2_ = o3d.geometry.LineSet.create_camera_visualization(intrinsic_parameters_["width"],
+                                                                         intrinsic_parameters_["height"],
+                                                                         intrinsic_parameters_["mat"], np.eye(4), scale_)
+        camera_mesh2_.paint_uniform_color(color)
+        camera_mesh2_.transform(result_)
+        vis_.add_geometry(camera_mesh2_)
+
+
 if __name__ == "__main__":
     args = parse_args()
 
@@ -165,7 +189,7 @@ if __name__ == "__main__":
     else:
         args.images = args.images[:-1] if args.images[-1] == '/' else args.images # remove trailing / (./a/b/ --> ./a/b)
         root_dir = os.path.dirname(args.images)
-    
+
     args.colmap_db = os.path.join(root_dir, args.colmap_db)
     args.colmap_text = os.path.join(root_dir, args.colmap_text)
 
@@ -228,6 +252,8 @@ if __name__ == "__main__":
 
     print(f"camera:\n\tres={w,h}\n\tcenter={cx,cy}\n\tfocal={fl_x,fl_y}\n\tfov={fovx,fovy}\n\tk={k1,k2} p={p1,p2} ")
 
+    all_c2w_ori = []
+    all_c2w_trans = []
     with open(os.path.join(TEXT_FOLDER, "images.txt"), "r") as f:
         i = 0
 
@@ -263,21 +289,37 @@ if __name__ == "__main__":
                 t = tvec.reshape([3, 1])
                 m = np.concatenate([np.concatenate([R, t], 1), bottom], 0)
                 c2w = np.linalg.inv(m)
-                
+                c2w_ori = np.copy(c2w)
+                all_c2w_ori.append(c2w_ori)
+
                 c2w[0:3, 2] *= -1 # flip the y and z axis
                 c2w[0:3, 1] *= -1
                 c2w = c2w[[1, 0, 2, 3],:] # swap y and z
                 c2w[2, :] *= -1 # flip whole world upside down
 
+                all_c2w_trans.append(c2w)
                 up += c2w[0:3, 1]
 
                 frame = {
-                    "file_path": rel_name, 
-                    "sharpness": b, 
-                    "transform_matrix": c2w
+                    "file_path": rel_name,
+                    "sharpness": b,
+                    "transform_matrix": c2w,
+                    "colmap": c2w_ori
                 }
 
                 frames.append(frame)
+
+    import open3d as o3d
+    k_mat = np.array([
+        [fl_x, 0, 0.5 * w],
+        [0, fl_x, 0.5 * h],
+        [0, 0, 1]
+    ])
+    intrinsic_parameters = {"mat": k_mat.astype(np.float64), "width": int(w), "height": int(h)}
+
+    vis = o3d.visualization.Visualizer()
+    vis.create_window(width=1920, height=1025)
+    add_cams(vis, intrinsic_parameters, all_c2w_ori, (1, 0, 0))
 
     N = len(frames)
     up = up / np.linalg.norm(up)
@@ -306,6 +348,7 @@ if __name__ == "__main__":
     totp /= totw
     for f in frames:
         f["transform_matrix"][0:3,3] -= totp
+
     avglen = 0.
     for f in frames:
         avglen += np.linalg.norm(f["transform_matrix"][0:3,3])
@@ -313,6 +356,13 @@ if __name__ == "__main__":
     print("[INFO] avg camera distance from origin", avglen)
     for f in frames:
         f["transform_matrix"][0:3,3] *= 4.0 / avglen # scale to "nerf sized"
+
+    add_cams(vis, intrinsic_parameters, [nerf_matrix_to_ngp(du11["transform_matrix"], scale=0.33, offset=[0, 0, 0])
+                                         for du11 in frames], (0, 0, 0), scale_=0.1)
+
+    add_cams(vis, intrinsic_parameters, [nerf_matrix_to_ngp(du11["transform_matrix"], scale=avglen/4, offset=[0, 0, 0])
+                                         for du11 in frames], (0, 0, 1))
+    print(1/(4/avglen*0.33))
 
     # sort frames by id
     frames.sort(key=lambda d: d['file_path'])
@@ -324,6 +374,10 @@ if __name__ == "__main__":
 
     for f in frames:
         f["transform_matrix"] = f["transform_matrix"].tolist()
+        f["colmap"] = f["colmap"].tolist()
+
+    vis.run()
+    vis.destroy_window()
 
     # construct frames
 
@@ -354,7 +408,7 @@ if __name__ == "__main__":
     if args.hold <= 0:
 
         write_json('transforms.json', frames)
-        
+
     else:
         all_ids = np.arange(N)
         test_ids = all_ids[::args.hold]
@@ -362,7 +416,8 @@ if __name__ == "__main__":
 
         frames_train = [f for i, f in enumerate(frames) if i in train_ids]
         frames_test = [f for i, f in enumerate(frames) if i in test_ids]
+        all_frames = [f for i, f in enumerate(frames) if i in all_ids]
 
-        write_json('transforms_train.json', frames_train)
+        write_json('transforms_train.json', all_frames)
         write_json('transforms_val.json', frames_test[::10])
-        write_json('transforms_test.json', frames_test)
+        write_json('transforms_test.json', all_frames)
