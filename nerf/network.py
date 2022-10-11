@@ -91,7 +91,6 @@ class NeRFNetwork(NeRFRenderer):
         else:
             self.bg_net = None
 
-
     def forward(self, x, d):
         # x: [N, 3], in [-bound, bound]
         # d: [N, 3], nomalized in [-1, 1]
@@ -133,7 +132,6 @@ class NeRFNetwork(NeRFRenderer):
             if l != self.num_layers - 1:
                 h = F.relu(h, inplace=True)
 
-        #sigma = F.relu(h[..., 0])
         sigma = trunc_exp(h[..., 0])
         geo_feat = h[..., 1:]
 
@@ -191,6 +189,7 @@ class NeRFNetwork(NeRFRenderer):
         return rgbs        
 
     # optimizer utils
+
     def get_params(self, lr):
 
         params = [

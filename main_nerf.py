@@ -116,7 +116,8 @@ if __name__ == '__main__':
         trainer = Trainer('ngp', opt, model, device=device, workspace=opt.workspace, criterion=criterion, fp16=opt.fp16,
                           metrics=metrics, use_checkpoint=opt.ckpt)
 
-        query_only = True
+        query_only = False
+
         if query_only:
             test_loader = NeRFDataset(opt, device=device, type='test').dataloader()
             trainer.query_only(test_loader, write_video=True)  # test and save video

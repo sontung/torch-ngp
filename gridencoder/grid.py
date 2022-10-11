@@ -140,15 +140,11 @@ class GridEncoder(nn.Module):
         # return: [..., num_levels * level_dim]
 
         inputs = (inputs + bound) / (2 * bound) # map to [0, 1]
-        
-        #print('inputs', inputs.shape, inputs.dtype, inputs.min().item(), inputs.max().item())
 
         prefix_shape = list(inputs.shape[:-1])
         inputs = inputs.view(-1, self.input_dim)
 
         outputs = grid_encode(inputs, self.embeddings, self.offsets, self.per_level_scale, self.base_resolution, inputs.requires_grad, self.gridtype_id, self.align_corners)
         outputs = outputs.view(prefix_shape + [self.output_dim])
-
-        #print('outputs', outputs.shape, outputs.dtype, outputs.min().item(), outputs.max().item())
 
         return outputs

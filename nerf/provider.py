@@ -11,8 +11,7 @@ import trimesh
 
 import torch
 from torch.utils.data import DataLoader
-
-from .utils import get_rays, get_rays_also_colmap
+from .utils import get_rays
 
 
 # ref: https://github.com/NVlabs/instant-ngp/blob/b76004c8cf478880227401ae763be4c02f80b62f/include/neural-graphics-primitives/nerf_loader.h#L50
@@ -33,6 +32,7 @@ def convert_mat(c2w):
     c2w[0:3, 1] *= -1  # flip the y and z axis
     c2w[0:3, 2] *= -1
     return c2w
+
 
 def visualize_poses(poses, size=0.1):
     # poses: [B, 4, 4]
@@ -99,7 +99,7 @@ def rand_poses(size, device, radius=1, theta_range=[np.pi/3, 2*np.pi/3], phi_ran
 
 
 class NeRFDataset:
-    def __init__(self, opt, device, type='train', downscale=1, n_test=10):
+    def __init__(self, opt, device, type='train', downscale=1, n_test=10, loading_gt_images=True):
         super().__init__()
         
         self.opt = opt
@@ -132,6 +132,7 @@ class NeRFDataset:
                 transform = json.load(f)
         elif self.mode == 'blender':
             # load all splits (train/valid/test), this is what instant-ngp in fact does...
+            # load train and val split
             if type == 'all':
                 transform_paths = glob.glob(os.path.join(self.root_path, '*.json'))
                 transform = None
@@ -142,7 +143,6 @@ class NeRFDataset:
                             transform = tmp_transform
                         else:
                             transform['frames'].extend(tmp_transform['frames'])
-            # load train and val split
             elif type == 'trainval':
                 with open(os.path.join(self.root_path, f'transforms_train.json'), 'r') as f:
                     transform = json.load(f)
@@ -167,8 +167,7 @@ class NeRFDataset:
         
         # read images
         frames = transform["frames"]
-        #frames = sorted(frames, key=lambda d: d['file_path']) # why do I sort...
-        
+
         # for colmap, manually interpolate a test set.
         if self.mode == 'colmap' and type == 'test':
             
@@ -187,7 +186,6 @@ class NeRFDataset:
                 pose[:3, :3] = slerp(ratio).as_matrix()
                 pose[:3, 3] = (1 - ratio) * pose0[:3, 3] + ratio * pose1[:3, 3]
                 self.poses.append(pose)
-            print("test")
 
         else:
             # for colmap, manually split a valid set (the first frame).
@@ -196,12 +194,9 @@ class NeRFDataset:
                     frames = frames[1:]
                 elif type == 'val':
                     frames = frames[:1]
-                # else 'all' or 'trainval' : use all frames
-            
+
             self.poses = []
             self.images = []
-            self.colmap_poses = []
-            self.transformation_matrices = []
             self.img_names = []
             for f in tqdm.tqdm(frames, desc=f'Loading {type} data'):
                 f_path = os.path.join(self.root_path, f['file_path'])
@@ -212,49 +207,45 @@ class NeRFDataset:
                 if not os.path.exists(f_path):
                     continue
 
-                pose_colmap = np.array(f['colmap'], dtype=np.float32)
                 pose_nerf = np.array(f['transform_matrix'], dtype=np.float32) # [4, 4]
                 pose = nerf_matrix_to_ngp(pose_nerf, scale=self.scale, offset=self.offset)
 
-                t_nerf_ngp = pose @ np.linalg.inv(pose_colmap)
-
-                image = cv2.imread(f_path, cv2.IMREAD_UNCHANGED) # [H, W, 3] o [H, W, 4]
                 if self.H is None or self.W is None:
+                    image = cv2.imread(f_path, cv2.IMREAD_UNCHANGED)
                     self.H = image.shape[0] // downscale
                     self.W = image.shape[1] // downscale
 
-                # add support for the alpha channel as a mask.
-                if image.shape[-1] == 3: 
-                    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-                else:
-                    image = cv2.cvtColor(image, cv2.COLOR_BGRA2RGBA)
+                if loading_gt_images:
+                    image = cv2.imread(f_path, cv2.IMREAD_UNCHANGED)
 
-                if image.shape[0] != self.H or image.shape[1] != self.W:
-                    image = cv2.resize(image, (self.W, self.H), interpolation=cv2.INTER_AREA)
-                    
-                image = image.astype(np.float32) / 255 # [H, W, 3/4]
+                    # add support for the alpha channel as a mask.
+                    if image.shape[-1] == 3:
+                        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                    else:
+                        image = cv2.cvtColor(image, cv2.COLOR_BGRA2RGBA)
 
-                self.transformation_matrices.append(t_nerf_ngp)
+                    if image.shape[0] != self.H or image.shape[1] != self.W:
+                        image = cv2.resize(image, (self.W, self.H), interpolation=cv2.INTER_AREA)
+
+                    image = image.astype(np.float32) / 255 # [H, W, 3/4]
+                    self.images.append(image)
+
                 self.poses.append(pose)
-                self.images.append(image)
-                self.colmap_poses.append(pose_colmap)
                 self.img_names.append(f['file_path'])
 
         # visualize_poses(np.stack(self.poses, axis=0))
-        self.poses = torch.from_numpy(np.stack(self.poses, axis=0)) # [N, 4, 4]
-        self.transformation_matrices = torch.from_numpy(np.stack(self.transformation_matrices, axis=0)) # [N, 4, 4]
-        self.colmap_poses = torch.from_numpy(np.stack(self.colmap_poses, axis=0))
+        self.poses = torch.from_numpy(np.stack(self.poses, axis=0))  # [N, 4, 4]
         self.img_names = np.array(self.img_names)
 
-        if self.images is not None:
-            self.images = torch.from_numpy(np.stack(self.images, axis=0)) # [N, H, W, C]
+        if self.images is not None and len(self.images) > 0:
+            self.images = torch.from_numpy(np.stack(self.images, axis=0))  # [N, H, W, C]
         
         # calculate mean radius of all camera poses
         self.radius = self.poses[:, :3, 3].norm(dim=-1).mean(0).item()
 
         # initialize error_map
         if self.training and self.opt.error_map:
-            self.error_map = torch.ones([self.images.shape[0], 128 * 128], dtype=torch.float) # [B, 128 * 128], flattened for easy indexing, fixed resolution...
+            self.error_map = torch.ones([self.images.shape[0], 128 * 128], dtype=torch.float)
         else:
             self.error_map = None
 
@@ -315,28 +306,20 @@ class NeRFDataset:
             }
 
         poses = self.poses[index].to(self.device) # [B, 4, 4]
-        poses_colmap = self.colmap_poses[index].to(self.device)
-        t_mat = self.transformation_matrices[index].to(self.device)
         error_map = None if self.error_map is None else self.error_map[index]
         
-        # rays = get_rays(poses, self.intrinsics, self.H, self.W, self.num_rays, error_map, self.opt.patch_size)
-        rays = get_rays_also_colmap(poses, poses_colmap, self.intrinsics, self.H, self.W, self.num_rays, error_map, self.opt.patch_size)
+        rays = get_rays(poses, self.intrinsics, self.H, self.W, self.num_rays, error_map, self.opt.patch_size)
 
         results = {
-            "t_mat": t_mat,
             "pose": poses,
-            "pose_colmap": poses_colmap,
             'H': self.H,
             'W': self.W,
             'rays_o': rays['rays_o'],
             'rays_d': rays['rays_d'],
-            'rays_o_colmap': rays['rays_o_colmap'],
-            'rays_d_colmap': rays['rays_d_colmap'],
-            'rays_d_cam': rays['rays_d_cam'],
             "name": self.img_names[index]
         }
 
-        if self.images is not None:
+        if self.images is not None and len(self.images) > 0:
             images = self.images[index].to(self.device) # [B, H, W, 3/4]
             if self.training:
                 C = images.shape[-1]

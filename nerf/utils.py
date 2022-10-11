@@ -32,6 +32,8 @@ from torch_ema import ExponentialMovingAverage
 
 from packaging import version as pver
 import lpips
+import pickle
+
 
 def custom_meshgrid(*args):
     # ref: https://pytorch.org/docs/stable/generated/torch.meshgrid.html?highlight=meshgrid#torch.meshgrid
@@ -49,6 +51,7 @@ def linear_to_srgb(x):
 @torch.jit.script
 def srgb_to_linear(x):
     return torch.where(x < 0.04045, x / 12.92, ((x + 0.055) / 1.055) ** 2.4)
+
 
 @torch.cuda.amp.autocast(enabled=False)
 def get_rays(poses, intrinsics, H, W, N=-1, error_map=None, patch_size=1):
@@ -331,11 +334,7 @@ def extract_fields(bound_min, bound_max, resolution, query_func, S=128):
 
 
 def extract_geometry(bound_min, bound_max, resolution, threshold, query_func):
-    #print('threshold: {}'.format(threshold))
     u = extract_fields(bound_min, bound_max, resolution, query_func)
-
-    #print(u.shape, u.max(), u.min(), np.percentile(u, 50))
-
     vertices, triangles = mcubes.marching_cubes(u, threshold)
 
     b_max_np = bound_max.detach().cpu().numpy()
@@ -370,7 +369,7 @@ def return_cam_mesh_with_pose(localization_results):
     return cameras
 
 
-def make_point_cloud_from_nerf(rgb_mat, xyz_mat, poses, ls):
+def make_point_cloud_from_nerf(rgb_mat, xyz_mat, poses):
     """
     making a point cloud which are observed by nerf's images
     :param rgb_mat: (n, x, y, 3)
@@ -391,9 +390,6 @@ def make_point_cloud_from_nerf(rgb_mat, xyz_mat, poses, ls):
     cameras = return_cam_mesh_with_pose(poses)
     for c in cameras:
         vis.add_geometry(c)
-
-    for line_set in ls:
-        vis.add_geometry(line_set)
 
     vis.run()
     vis.destroy_window()
@@ -470,6 +466,7 @@ class PSNRMeter:
     def report(self):
         return f'PSNR = {self.measure():.6f}'
 
+
 class LPIPSMeter:
     def __init__(self, net='alex', device=None):
         self.V = 0
@@ -505,6 +502,7 @@ class LPIPSMeter:
 
     def report(self):
         return f'LPIPS ({self.net}) = {self.measure():.6f}'
+
 
 class Trainer(object):
     def __init__(self,
@@ -641,11 +639,9 @@ class Trainer(object):
             self.clip_loss = CLIPLoss(self.device)
             self.clip_loss.prepare_text([self.opt.clip_text]) # only support one text prompt now...
 
-
     def __del__(self):
         if self.log_ptr:
             self.log_ptr.close()
-
 
     def log(self, *args, **kwargs):
         if self.local_rank == 0:
@@ -792,12 +788,12 @@ class Trainer(object):
         if bg_color is not None:
             bg_color = bg_color.to(self.device)
 
-        outputs = self.model.render(rays_o, rays_d, staged=True, bg_color=bg_color, perturb=perturb, **vars(self.opt))
+        outputs = self.model.query_depth_only(rays_o, rays_d, staged=True,
+                                              bg_color=bg_color, perturb=perturb, **vars(self.opt))
 
-        pred_rgb = outputs['image'].reshape(-1, H, W, 3)
         pred_depth = outputs['depth'].reshape(-1, H, W)
 
-        return pred_rgb, pred_depth
+        return pred_depth
 
     def save_mesh(self, save_path=None, resolution=256, threshold=10):
 
@@ -814,7 +810,8 @@ class Trainer(object):
                     sigma = self.model.density(pts.to(self.device))['sigma']
             return sigma
 
-        vertices, triangles = extract_geometry(self.model.aabb_infer[:3], self.model.aabb_infer[3:], resolution=resolution, threshold=threshold, query_func=query_func)
+        vertices, triangles = extract_geometry(self.model.aabb_infer[:3], self.model.aabb_infer[3:],
+                                               resolution=resolution, threshold=threshold, query_func=query_func)
 
         mesh = trimesh.Trimesh(vertices, triangles, process=False) # important, process=True leads to seg fault...
         mesh.export(save_path)
@@ -833,7 +830,7 @@ class Trainer(object):
 
         # get a ref to error_map
         self.error_map = train_loader._data.error_map
-
+        print("train for ", max_epochs)
         for epoch in range(self.epoch + 1, max_epochs + 1):
             self.epoch = epoch
 
@@ -906,17 +903,8 @@ class Trainer(object):
 
         self.log(f"==> Finished Test.")
 
-    def query_only(self, loader, save_path=None, name=None, write_video=True):
-
-        if save_path is None:
-            save_path = os.path.join(self.workspace, 'results')
-
-        if name is None:
-            name = f'{self.name}_ep{self.epoch:04d}'
-
-        os.makedirs(save_path, exist_ok=True)
-
-        self.log(f"==> Start Test, save results to {save_path}")
+    # @profile
+    def query_only(self, loader):
 
         pbar = tqdm.tqdm(total=len(loader) * loader.batch_size,
                          bar_format='{percentage:3.0f}% {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]')
@@ -927,21 +915,13 @@ class Trainer(object):
         all_rd = []
         all_names = []
         all_sizes = []
-        all_rgb = []
         all_xyz = []
         all_pose = []
-        list1 = []
 
-        debug_data = {}
         with torch.no_grad():
             for i, data in enumerate(loader):
                 with torch.cuda.amp.autocast(enabled=self.fp16):
-                    preds, preds_depth = self.test_step(data)
-
-                if self.opt.color_space == 'linear':
-                    preds = linear_to_srgb(preds)
-
-                pred = preds[0].detach().cpu().numpy()
+                    preds_depth = self.test_step(data)
 
                 img_name = data["name"]
                 depth = torch.reshape(preds_depth[0], (-1,)).cpu()
@@ -953,38 +933,21 @@ class Trainer(object):
 
                 pred_3D_ngp = ro + depth[..., None] * rd
                 pred_3D_ngp = pred_3D_ngp.to(self.device)
-                # pred_3D_ngp_homog = torch.cat([pred_3D_ngp, torch.ones((pred_3D_ngp.shape[0], 1), device=self.device)],
-                #                               axis=1)
-                # pred_3D_nerf = (torch.inverse(data["t_mat"]) @ pred_3D_ngp_homog.T).T
 
                 all_xyz.append(pred_3D_ngp.cpu().numpy())
                 all_pose.append(data["pose"].detach().cpu().numpy())
 
-                # all_xyz.append(pred_3D_nerf[:, :3, 0].cpu().numpy())
-                # all_pose.append(data["pose_colmap"].detach().cpu().numpy())
-
-                debug_data[img_name[0]] = [preds.cpu(), preds_depth.cpu()]
-
-                all_rgb.append(pred)
                 all_ro.append(rays_o[0].cpu().numpy())
                 all_rd.append(rays_d[0].cpu().numpy())
                 all_depths.append(depth.cpu().numpy())
                 all_names.append(img_name[0])
-                all_sizes.append(pred.shape)
+                all_sizes.append(preds_depth.shape)
 
                 pbar.update(loader.batch_size)
-                # break
-                # if i > 5:
-                #     break
-        import pickle
-        # data = [all_ro, all_rd, all_depths, all_names, all_sizes]
-        with open('debug.pickle', 'wb') as handle:
-            pickle.dump(debug_data, handle, protocol=pickle.HIGHEST_PROTOCOL)
 
-        if len(all_xyz) > 0:
-            all_xyz = np.stack(all_xyz, axis=0)
-            all_rgb = np.stack(all_rgb, axis=0).reshape((all_xyz.shape[0], -1, 3))
-        make_point_cloud_from_nerf(all_rgb, all_xyz, all_pose, list1)
+        data = [all_ro, all_rd, all_depths, all_names, all_sizes, all_xyz, all_pose]
+        with open('debug.pickle', 'wb') as handle:
+            pickle.dump(data, handle, protocol=pickle.HIGHEST_PROTOCOL)
 
     # [GUI] just train for 16 steps, without any other overhead that may slow down rendering.
     def train_gui(self, train_loader, step=16):

@@ -213,18 +213,15 @@ def main():
 
     print(f"camera:\n\tres={w,h}\n\tcenter={cx,cy}\n\tfocal={fl_x,fl_y}\n\tfov={fovx,fovy}\n\tk={k1,k2} p={p1,p2} ")
 
-    all_c2w_ori = []
-    all_c2w_trans = []
     train_ids = []
     test_ids = []
-    img_id = 0
+    img_id = -1
+    skip = 5
+    nb_train_samples = 0
+    all_frames = []
     with open(IMAGE_FILE, "r") as f:
         i = 0
-
         bottom = np.array([0.0, 0.0, 0.0, 1.0]).reshape([1, 4])
-
-        frames = []
-
         up = np.zeros(3)
         f = list(f)
         for line in tqdm(f):
@@ -235,12 +232,12 @@ def main():
 
             i = i + 1
             if i % 2 == 1:
-                elems = line.split(" ")  # 1-4 is quat, 5-7 is trans, 9ff is filename (9, if filename contains no spaces)
+                img_id += 1
+                elems = line.split(" ")
 
                 name = '_'.join(elems[9:])
                 full_name = os.path.join(IMAGE_FOLDER, name)
                 b = sharpness(full_name)
-                image_id = int(elems[0])
                 qvec = np.array(tuple(map(float, elems[1:5])))
                 tvec = np.array(tuple(map(float, elems[5:8])))
                 R = qvec2rotmat(-qvec)
@@ -248,32 +245,29 @@ def main():
                 m = np.concatenate([np.concatenate([R, t], 1), bottom], 0)
                 c2w = np.linalg.inv(m)
                 c2w_ori = np.copy(c2w)
-                all_c2w_ori.append(c2w_ori)
 
                 c2w[0:3, 2] *= -1  # flip the y and z axis
                 c2w[0:3, 1] *= -1
                 c2w = c2w[[1, 0, 2, 3], :]  # swap y and z
                 c2w[2, :] *= -1  # flip whole world upside down
 
-                all_c2w_trans.append(c2w)
-                up += c2w[0:3, 1]
-
                 frame = {
                     "file_path": name,
                     "sharpness": b,
                     "transform_matrix": c2w,
-                    "colmap": c2w_ori
+                    "colmap": c2w_ori,
+                    "train": name not in QUERY_LIST
                 }
 
-                frames.append(frame)
-
+                all_frames.append(frame)
                 if name in QUERY_LIST:
                     test_ids.append(img_id)
                 else:
-                    train_ids.append(img_id)
-                img_id += 1
+                    up += c2w[0:3, 1]
+                    nb_train_samples += 1
+                    if img_id % skip == 0:
+                        train_ids.append(img_id)
 
-    N = len(frames)
     up = up / np.linalg.norm(up)
 
     print("[INFO] up vector was", up)
@@ -282,37 +276,40 @@ def main():
     R = np.pad(R, [0, 1])
     R[-1, -1] = 1
 
-    for f in frames:
+    for f in all_frames:
         f["transform_matrix"] = np.matmul(R, f["transform_matrix"]) # rotate up to be the z axis
 
     # find a central point they are all looking at
     print("[INFO] computing center of attention...")
     totw = 0.0
     totp = np.array([0.0, 0.0, 0.0])
-    for f in tqdm(frames):
-        mf = f["transform_matrix"][0:3, :]
-        for g in frames:
-            mg = g["transform_matrix"][0:3, :]
-            p, weight = closest_point_2_lines(mf[:,3], mf[:,2], mg[:,3], mg[:,2])
-            if weight > 0.01:
-                totp += p * weight
-                totw += weight
+    for f in tqdm(all_frames[::5]):
+        if f["train"]:
+            mf = f["transform_matrix"][0:3, :]
+            for g in all_frames[::10]:
+                if g["train"]:
+                    mg = g["transform_matrix"][0:3, :]
+                    p, weight = closest_point_2_lines(mf[:, 3], mf[:, 2], mg[:, 3], mg[:, 2])
+                    if weight > 0.01:
+                        totp += p * weight
+                        totw += weight
     totp /= totw
-    for f in frames:
-        f["transform_matrix"][0:3,3] -= totp
+    for f in all_frames:
+        f["transform_matrix"][0:3, 3] -= totp
 
     avglen = 0.
-    for f in frames:
-        avglen += np.linalg.norm(f["transform_matrix"][0:3,3])
-    avglen /= N
+    for f in all_frames:
+        if f["train"]:
+            avglen += np.linalg.norm(f["transform_matrix"][0:3, 3])
+    avglen /= nb_train_samples
     print("[INFO] avg camera distance from origin", avglen)
-    for f in frames:
-        f["transform_matrix"][0:3,3] *= 4.0 / avglen # scale to "nerf sized"
+    for f in all_frames:
+        f["transform_matrix"][0:3, 3] *= 4.0 / avglen  # scale to "nerf sized"
 
     # sort frames by id
-    frames.sort(key=lambda d: d['file_path'])
+    all_frames.sort(key=lambda d: d['file_path'])
 
-    for f in frames:
+    for f in all_frames:
         f["transform_matrix"] = f["transform_matrix"].tolist()
         f["colmap"] = f["colmap"].tolist()
 
@@ -343,18 +340,21 @@ def main():
 
     # just one transforms.json, don't do data split
 
-    all_ids = np.arange(N)
     test_ids = np.array(test_ids)
     train_ids = np.array(train_ids)
 
-    frames_train = [f for i, f in enumerate(frames) if i in train_ids]
-    frames_test = [f for i, f in enumerate(frames) if i in test_ids]
-    all_frames = [f for i, f in enumerate(frames) if i in all_ids]
+    frames_train = [f for i, f in enumerate(all_frames) if i in train_ids]
+    frames_test = [f for i, f in enumerate(all_frames) if i in test_ids]
+    all_frames = [f for i, f in enumerate(all_frames)]
+    all_frames_train = [f for i, f in enumerate(all_frames) if f["train"]]
+    all_frames_query = [f for i, f in enumerate(all_frames) if not f["train"]]
 
     write_json('transforms_train.json', frames_train)
-    write_json('transforms_val.json', frames_test[::10])
-    write_json('transforms_test.json', frames_test)
+    write_json('transforms_val.json', frames_test[::50])
+    write_json('transforms_test.json', frames_test[::10])
     write_json('transforms_all.json', all_frames)
+    write_json('transforms_all_db.json', all_frames_train)
+    write_json('transforms_all_query.json', all_frames_query)
 
 
 if __name__ == '__main__':
