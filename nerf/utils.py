@@ -917,6 +917,7 @@ class Trainer(object):
         all_sizes = []
         all_xyz = []
         all_pose = []
+        file_id = 0
 
         with torch.no_grad():
             for i, data in enumerate(loader):
@@ -945,9 +946,15 @@ class Trainer(object):
 
                 pbar.update(loader.batch_size)
 
-        data = [all_ro, all_rd, all_depths, all_names, all_sizes, all_xyz, all_pose]
-        with open('debug.pickle', 'wb') as handle:
-            pickle.dump(data, handle, protocol=pickle.HIGHEST_PROTOCOL)
+                if i % 500 == 0 and i > 10:
+                    tqdm.tqdm.write("saving and clearing")
+                    data = [all_ro, all_rd, all_depths, all_names, all_sizes, all_xyz, all_pose]
+                    with open(f'debug-{file_id}.pickle', 'wb') as handle:
+                        pickle.dump(data, handle, protocol=pickle.HIGHEST_PROTOCOL)
+                    file_id += 1
+                    for list_ in [all_ro, all_rd, all_depths, all_names, all_sizes, all_xyz, all_pose]:
+                        list_.clear()
+
 
     # [GUI] just train for 16 steps, without any other overhead that may slow down rendering.
     def train_gui(self, train_loader, step=16):
