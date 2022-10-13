@@ -1,5 +1,7 @@
 import os
 import glob
+import sys
+
 import tqdm
 import math
 import open3d as o3d
@@ -921,10 +923,10 @@ class Trainer(object):
 
         with torch.no_grad():
             for i, data in enumerate(loader):
+                img_name = data["name"]
+
                 with torch.cuda.amp.autocast(enabled=self.fp16):
                     preds_depth = self.test_step(data)
-
-                img_name = data["name"]
                 depth = torch.reshape(preds_depth[0], (-1,)).cpu()
 
                 rays_o = data['rays_o']  # [B, N, 3]
@@ -944,17 +946,14 @@ class Trainer(object):
                 all_names.append(img_name[0])
                 all_sizes.append(preds_depth.shape)
 
-                pbar.update(loader.batch_size)
-
-                if i % 500 == 0 and i > 10:
-                    tqdm.tqdm.write("saving and clearing")
+                if i % 100 == 0 and i > 10:
                     data = [all_ro, all_rd, all_depths, all_names, all_sizes, all_xyz, all_pose]
                     with open(f'debug-{file_id}.pickle', 'wb') as handle:
                         pickle.dump(data, handle, protocol=pickle.HIGHEST_PROTOCOL)
                     file_id += 1
                     for list_ in [all_ro, all_rd, all_depths, all_names, all_sizes, all_xyz, all_pose]:
                         list_.clear()
-
+                pbar.update(loader.batch_size)
 
     # [GUI] just train for 16 steps, without any other overhead that may slow down rendering.
     def train_gui(self, train_loader, step=16):
